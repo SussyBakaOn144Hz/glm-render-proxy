@@ -3,19 +3,21 @@ const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+const cors = require("cors");
 
 const app = express();
+app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 
 const PORT = process.env.PORT || 10000;
 const GLM_ENDPOINT = "https://api.us-west-2.modal.direct/v1/chat/completions";
 const API_KEY = process.env.GLM_API_KEY;
 
-// memory folder
+// ---------- memory folder ----------
 const SESS_DIR = path.join(__dirname, "sessions");
 if (!fs.existsSync(SESS_DIR)) fs.mkdirSync(SESS_DIR);
 
-// ---------- ping ----------
+// ---------- keep alive ----------
 app.get("/ping", (req, res) => {
   res.json({ status: "alive" });
 });
@@ -76,7 +78,7 @@ async function regenerateSummary(oldSummary, newMessages) {
   return response.data.choices?.[0]?.message?.content || oldSummary;
 }
 
-// ---------- main endpoint ----------
+// ---------- OpenAI-compatible endpoint ----------
 app.post("/v1/chat/completions", async (req, res) => {
   try {
     const body = req.body;
