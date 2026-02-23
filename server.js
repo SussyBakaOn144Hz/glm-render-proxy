@@ -17,7 +17,7 @@ const API_KEY = process.env.GLM_API_KEY;
 const SESS_DIR = path.join(__dirname, "sessions");
 if (!fs.existsSync(SESS_DIR)) fs.mkdirSync(SESS_DIR);
 
-// ---------- keep alive ----------
+// ---------- ping route ----------
 app.get("/ping", (req, res) => {
   res.json({ status: "alive" });
 });
@@ -78,7 +78,7 @@ async function regenerateSummary(oldSummary, newMessages) {
   return response.data.choices?.[0]?.message?.content || oldSummary;
 }
 
-// ---------- OpenAI-compatible endpoint ----------
+// ---------- main endpoint ----------
 app.post("/v1/chat/completions", async (req, res) => {
   try {
     const body = req.body;
@@ -92,7 +92,7 @@ app.post("/v1/chat/completions", async (req, res) => {
 
     session.unsummarized += 1;
 
-    // every 20 turns → memory update
+    // memory update every 20 turns
     if (session.unsummarized >= 20) {
       session.summary = await regenerateSummary(
         session.summary,
@@ -114,12 +114,39 @@ app.post("/v1/chat/completions", async (req, res) => {
 
     finalMessages = finalMessages.concat(recent);
 
+    const finalBody = {
+      ...body,
+      messages: finalMessages
+    };
+
+    saveSession(sessionId, session);
+
+    // ---------- STREAM MODE ----------
+    if (body.stream) {
+      const response = await axios({
+        method: "post",
+        url: GLM_ENDPOINT,
+        data: finalBody,
+        responseType: "stream",
+        headers: {
+          Authorization: `Bearer ${API_KEY}`,
+          "Content-Type": "application/json"
+        },
+        timeout: 300000
+      });
+
+      res.setHeader("Content-Type", "text/event-stream");
+      res.setHeader("Cache-Control", "no-cache");
+      res.setHeader("Connection", "keep-alive");
+
+      response.data.pipe(res);
+      return;
+    }
+
+    // ---------- NORMAL MODE ----------
     const response = await axios.post(
       GLM_ENDPOINT,
-      {
-        ...body,
-        messages: finalMessages
-      },
+      finalBody,
       {
         headers: {
           Authorization: `Bearer ${API_KEY}`,
@@ -129,9 +156,8 @@ app.post("/v1/chat/completions", async (req, res) => {
       }
     );
 
-    saveSession(sessionId, session);
-
     res.json(response.data);
+
   } catch (err) {
     console.error(err.response?.data || err.message);
     res.status(500).json({ error: "proxy failure" });
