@@ -13,30 +13,28 @@ const PORT = process.env.PORT || 10000;
 const GLM_ENDPOINT = "https://api.us-west-2.modal.direct/v1/chat/completions";
 const API_KEY = process.env.GLM_API_KEY;
 
-// ---------- memory folder ----------
 const SESS_DIR = path.join(__dirname, "sessions");
 if (!fs.existsSync(SESS_DIR)) fs.mkdirSync(SESS_DIR);
 
-// ---------- ping route ----------
 app.get("/ping", (req, res) => {
   res.json({ status: "alive" });
 });
 
-// ---------- session id ----------
 function generateSessionId(body) {
   if (body.conversation_id) return body.conversation_id;
-
   const first = body.messages?.[0]?.content || "default";
   return crypto.createHash("sha256").update(first).digest("hex");
 }
 
-// ---------- load/save ----------
 function loadSession(sessionId) {
   const file = path.join(SESS_DIR, `${sessionId}.json`);
-  if (fs.existsSync(file)) {
-    return JSON.parse(fs.readFileSync(file));
-  }
-  return { summary: "", unsummarized: 0 };
+  if (fs.existsSync(file)) return JSON.parse(fs.readFileSync(file));
+
+  return {
+    summary: "",
+    core: [],
+    unsummarized: 0
+  };
 }
 
 function saveSession(sessionId, data) {
@@ -44,84 +42,151 @@ function saveSession(sessionId, data) {
   fs.writeFileSync(file, JSON.stringify(data));
 }
 
-// ---------- summary engine ----------
-async function regenerateSummary(oldSummary, newMessages) {
+function extractPinned(messages, session) {
+  for (const m of messages) {
+    if (!m.content) continue;
+    const txt = m.content.toLowerCase();
+
+    if (txt.includes("remember this permanently")) {
+      session.core.push(
+        m.content.replace(/remember this permanently[:\-]?/i, "").trim()
+      );
+    }
+
+    if (txt.includes("lock this memory")) {
+      session.core.push(
+        m.content.replace(/lock this memory[:\-]?/i, "").trim()
+      );
+    }
+  }
+}
+
+async function regenerateMemory(oldSummary, coreMemory, newMessages) {
   const prompt = [
     {
       role: "system",
       content:
-        "You are a long-term RP memory engine.\nRewrite structured memory.\nPreserve small details like preferences, secrets, personality, relationships.\nFormat:\nSTORY SUMMARY:\nCHARACTER MEMORY:\nRELATIONSHIP STATE:"
+`You manage long-term roleplay memory.
+
+1. Update STORY SUMMARY.
+2. Extract NEW permanent facts:
+- major events
+- secrets
+- promises
+- relationship shifts
+
+Return JSON:
+{
+ "summary": "...",
+ "new_core": ["..."]
+}`
     },
     {
       role: "user",
       content:
-        `Old summary:\n${oldSummary}\n\nNew:\n${JSON.stringify(newMessages)}`
+`OLD SUMMARY:
+${oldSummary}
+
+CORE MEMORY:
+${coreMemory.join("\n")}
+
+NEW:
+${JSON.stringify(newMessages)}`
     }
   ];
 
-  const response = await axios.post(
-    GLM_ENDPOINT,
-    {
-      model: "zai-org/GLM-5-FP8",
-      messages: prompt,
-      temperature: 0.4
-    },
-    {
-      headers: {
-        Authorization: `Bearer ${API_KEY}`,
-        "Content-Type": "application/json"
+  try {
+    const r = await axios.post(
+      GLM_ENDPOINT,
+      {
+        model: "zai-org/GLM-5-FP8",
+        messages: prompt,
+        temperature: 0.4
       },
-      timeout: 300000
-    }
-  );
+      {
+        headers: {
+          Authorization: `Bearer ${API_KEY}`,
+          "Content-Type": "application/json"
+        },
+        timeout: 180000
+      }
+    );
 
-  return response.data.choices?.[0]?.message?.content || oldSummary;
+    const text = r.data.choices?.[0]?.message?.content;
+    let parsed;
+
+    try { parsed = JSON.parse(text); }
+    catch { return { summary: oldSummary, new_core: [] }; }
+
+    return parsed;
+
+  } catch {
+    return { summary: oldSummary, new_core: [] };
+  }
 }
 
-// ---------- main endpoint ----------
 app.post("/v1/chat/completions", async (req, res) => {
   try {
     const body = req.body;
-
-    if (!body.messages) {
-      return res.status(400).json({ error: "no messages" });
-    }
+    if (!body.messages) return res.status(400).json({ error: "no messages" });
 
     const sessionId = generateSessionId(body);
     const session = loadSession(sessionId);
 
+    extractPinned(body.messages, session);
+
     session.unsummarized += 1;
 
-    // memory update every 20 turns
     if (session.unsummarized >= 20) {
-      session.summary = await regenerateSummary(
+      const memUpdate = await regenerateMemory(
         session.summary,
+        session.core,
         body.messages.slice(-20)
       );
+
+      session.summary = memUpdate.summary || session.summary;
+
+      if (memUpdate.new_core?.length) {
+        for (const c of memUpdate.new_core) {
+          if (!session.core.includes(c)) session.core.push(c);
+        }
+      }
+
       session.unsummarized = 0;
     }
 
     const recent = body.messages.slice(-30);
-
     let finalMessages = [];
+
+    // 🔒 MASTER PROMPT ANCHOR
+    if (process.env.MASTER_PROMPT) {
+      finalMessages.push({
+        role: "system",
+        content: process.env.MASTER_PROMPT
+      });
+    }
+
+    if (session.core.length) {
+      finalMessages.push({
+        role: "system",
+        content: "CORE MEMORY:\n" + session.core.join("\n")
+      });
+    }
 
     if (session.summary) {
       finalMessages.push({
         role: "system",
-        content: `Memory:\n${session.summary}`
+        content: "STORY SUMMARY:\n" + session.summary
       });
     }
 
     finalMessages = finalMessages.concat(recent);
 
-    const finalBody = {
-      ...body,
-      messages: finalMessages
-    };
+    const finalBody = { ...body, messages: finalMessages };
 
     saveSession(sessionId, session);
 
-    // ---------- STREAM MODE ----------
+    // STREAM
     if (body.stream) {
       const response = await axios({
         method: "post",
@@ -138,12 +203,12 @@ app.post("/v1/chat/completions", async (req, res) => {
       res.setHeader("Content-Type", "text/event-stream");
       res.setHeader("Cache-Control", "no-cache");
       res.setHeader("Connection", "keep-alive");
+      res.flushHeaders();
 
       response.data.pipe(res);
       return;
     }
 
-    // ---------- NORMAL MODE ----------
     const response = await axios.post(
       GLM_ENDPOINT,
       finalBody,
@@ -165,5 +230,5 @@ app.post("/v1/chat/completions", async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log("Server running");
 });
