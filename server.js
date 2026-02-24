@@ -229,7 +229,7 @@ app.post("/v1/chat/completions", async (req, res) => {
       });
 
       const watchdog = setInterval(() => {
-        if (Date.now() - lastChunkTime > 30000) {
+        if (Date.now() - lastChunkTime > 60000) {
           response.data.destroy();
           res.end();
           clearInterval(watchdog);
