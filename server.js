@@ -13,28 +13,31 @@ const PORT = process.env.PORT || 10000;
 const GLM_ENDPOINT = "https://api.us-west-2.modal.direct/v1/chat/completions";
 const API_KEY = process.env.GLM_API_KEY;
 
+const axiosInstance = axios.create({
+  timeout: 180000 // 3 min hard timeout
+});
+
+// ---------- memory folder ----------
 const SESS_DIR = path.join(__dirname, "sessions");
 if (!fs.existsSync(SESS_DIR)) fs.mkdirSync(SESS_DIR);
 
+// ---------- ping ----------
 app.get("/ping", (req, res) => {
   res.json({ status: "alive" });
 });
 
+// ---------- session id ----------
 function generateSessionId(body) {
   if (body.conversation_id) return body.conversation_id;
   const first = body.messages?.[0]?.content || "default";
   return crypto.createHash("sha256").update(first).digest("hex");
 }
 
+// ---------- load/save ----------
 function loadSession(sessionId) {
   const file = path.join(SESS_DIR, `${sessionId}.json`);
   if (fs.existsSync(file)) return JSON.parse(fs.readFileSync(file));
-
-  return {
-    summary: "",
-    core: [],
-    unsummarized: 0
-  };
+  return { summary: "", core: [], unsummarized: 0 };
 }
 
 function saveSession(sessionId, data) {
@@ -42,6 +45,7 @@ function saveSession(sessionId, data) {
   fs.writeFileSync(file, JSON.stringify(data));
 }
 
+// ---------- manual pin detection ----------
 function extractPinned(messages, session) {
   for (const m of messages) {
     if (!m.content) continue;
@@ -61,6 +65,7 @@ function extractPinned(messages, session) {
   }
 }
 
+// ---------- memory update ----------
 async function regenerateMemory(oldSummary, coreMemory, newMessages) {
   const prompt = [
     {
@@ -70,10 +75,10 @@ async function regenerateMemory(oldSummary, coreMemory, newMessages) {
 
 1. Update STORY SUMMARY.
 2. Extract NEW permanent facts:
-- major events
-- secrets
-- promises
-- relationship shifts
+   - major events
+   - secrets
+   - promises
+   - milestones
 
 Return JSON:
 {
@@ -90,31 +95,38 @@ ${oldSummary}
 CORE MEMORY:
 ${coreMemory.join("\n")}
 
-NEW:
+NEW DIALOGUE:
 ${JSON.stringify(newMessages)}`
     }
   ];
 
   try {
-    const r = await axios.post(
-      GLM_ENDPOINT,
-      {
-        model: "zai-org/GLM-5-FP8",
-        messages: prompt,
-        temperature: 0.4
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${API_KEY}`,
-          "Content-Type": "application/json"
-        },
-        timeout: 180000
+    let response;
+
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        response = await axiosInstance.post(
+          GLM_ENDPOINT,
+          {
+            model: "zai-org/GLM-5-FP8",
+            messages: prompt,
+            temperature: 0.4
+          },
+          {
+            headers: {
+              Authorization: `Bearer ${API_KEY}`,
+              "Content-Type": "application/json"
+            }
+          }
+        );
+        break;
+      } catch (err) {
+        if (attempt === 2) throw err;
       }
-    );
+    }
 
-    const text = r.data.choices?.[0]?.message?.content;
+    const text = response.data.choices?.[0]?.message?.content;
     let parsed;
-
     try { parsed = JSON.parse(text); }
     catch { return { summary: oldSummary, new_core: [] }; }
 
@@ -125,10 +137,12 @@ ${JSON.stringify(newMessages)}`
   }
 }
 
+// ---------- main endpoint ----------
 app.post("/v1/chat/completions", async (req, res) => {
   try {
     const body = req.body;
-    if (!body.messages) return res.status(400).json({ error: "no messages" });
+    if (!body.messages)
+      return res.status(400).json({ error: "no messages" });
 
     const sessionId = generateSessionId(body);
     const session = loadSession(sessionId);
@@ -146,7 +160,7 @@ app.post("/v1/chat/completions", async (req, res) => {
 
       session.summary = memUpdate.summary || session.summary;
 
-      if (memUpdate.new_core?.length) {
+      if (memUpdate.new_core) {
         for (const c of memUpdate.new_core) {
           if (!session.core.includes(c)) session.core.push(c);
         }
@@ -156,15 +170,8 @@ app.post("/v1/chat/completions", async (req, res) => {
     }
 
     const recent = body.messages.slice(-30);
-    let finalMessages = [];
 
-    // 🔒 MASTER PROMPT ANCHOR
-    if (process.env.MASTER_PROMPT) {
-      finalMessages.push({
-        role: "system",
-        content: process.env.MASTER_PROMPT
-      });
-    }
+    let finalMessages = [];
 
     if (session.core.length) {
       finalMessages.push({
@@ -186,40 +193,77 @@ app.post("/v1/chat/completions", async (req, res) => {
 
     saveSession(sessionId, session);
 
-    // STREAM
+    // ---------- STREAM ----------
     if (body.stream) {
-      const response = await axios({
-        method: "post",
-        url: GLM_ENDPOINT,
-        data: finalBody,
-        responseType: "stream",
-        headers: {
-          Authorization: `Bearer ${API_KEY}`,
-          "Content-Type": "application/json"
-        },
-        timeout: 300000
-      });
+
+      let response;
+
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        try {
+          response = await axiosInstance({
+            method: "post",
+            url: GLM_ENDPOINT,
+            data: finalBody,
+            responseType: "stream",
+            headers: {
+              Authorization: `Bearer ${API_KEY}`,
+              "Content-Type": "application/json"
+            }
+          });
+          break;
+        } catch (err) {
+          if (attempt === 2) throw err;
+        }
+      }
 
       res.setHeader("Content-Type", "text/event-stream");
       res.setHeader("Cache-Control", "no-cache");
       res.setHeader("Connection", "keep-alive");
       res.flushHeaders();
 
-      response.data.pipe(res);
+      let lastChunkTime = Date.now();
+
+      response.data.on("data", chunk => {
+        lastChunkTime = Date.now();
+        res.write(chunk);
+      });
+
+      const watchdog = setInterval(() => {
+        if (Date.now() - lastChunkTime > 30000) {
+          response.data.destroy();
+          res.end();
+          clearInterval(watchdog);
+        }
+      }, 10000);
+
+      response.data.on("end", () => {
+        clearInterval(watchdog);
+        res.end();
+      });
+
       return;
     }
 
-    const response = await axios.post(
-      GLM_ENDPOINT,
-      finalBody,
-      {
-        headers: {
-          Authorization: `Bearer ${API_KEY}`,
-          "Content-Type": "application/json"
-        },
-        timeout: 300000
+    // ---------- NORMAL ----------
+    let response;
+
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        response = await axiosInstance.post(
+          GLM_ENDPOINT,
+          finalBody,
+          {
+            headers: {
+              Authorization: `Bearer ${API_KEY}`,
+              "Content-Type": "application/json"
+            }
+          }
+        );
+        break;
+      } catch (err) {
+        if (attempt === 2) throw err;
       }
-    );
+    }
 
     res.json(response.data);
 
