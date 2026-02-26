@@ -29,9 +29,9 @@ function sessionFile(id) {
 function loadSession(id) {
   const f = sessionFile(id);
   if (fs.existsSync(f)) return JSON.parse(fs.readFileSync(f));
+
   return {
     canon: [],
-    active_state: "",
     turn_counter: 0,
     pending_memory: null
   };
@@ -59,27 +59,32 @@ app.post("/v1/chat/completions", async (req, res) => {
   try {
     const body = req.body;
     const convoId = getConversationId(body);
+
+    // 🔥 RESET COMMAND
+    const lastMsgRaw = body.messages?.slice(-1)[0]?.content || "";
+    const lastMsg = lastMsgRaw.trim().toLowerCase();
+
+    if (lastMsg === "/reset") {
+      const file = sessionFile(convoId);
+      if (fs.existsSync(file)) fs.unlinkSync(file);
+
+      return res.json({
+        choices: [
+          {
+            message: {
+              role: "assistant",
+              content: "(OOC: Memory reset for this conversation.)"
+            }
+          }
+        ]
+      });
+    }
+
     const session = loadSession(convoId);
-const lastMsg = body.messages?.slice(-1)[0]?.content?.trim().toLowerCase();
 
-if (lastMsg === "/reset") {
-  const file = sessionFile(convoId);
-  if (fs.existsSync(file)) fs.unlinkSync(file);
-
-  return res.json({
-    choices: [{
-      message: {
-        role: "assistant",
-        content: "(OOC: Memory reset for this conversation.)"
-      }
-    }]
-  });
-}
-    const lastMsg = body.messages?.slice(-1)[0]?.content || "";
-
-    // Handle confirmation reply
+    // Handle memory confirmation
     if (session.pending_memory) {
-      const decision = extractYesNo(lastMsg);
+      const decision = extractYesNo(lastMsgRaw);
       if (decision === true) {
         session.canon.push(session.pending_memory);
       }
@@ -97,7 +102,6 @@ if (lastMsg === "/reset") {
 
     const finalMessages = [];
 
-    // MASTER PROMPT injection
     if (MASTER_PROMPT) {
       finalMessages.push({
         role: "system",
@@ -105,7 +109,6 @@ if (lastMsg === "/reset") {
       });
     }
 
-    // Canon memory injection
     if (memoryBlock) {
       finalMessages.push({
         role: "system",
@@ -119,7 +122,7 @@ if (lastMsg === "/reset") {
       ...body,
       messages: finalMessages,
       max_tokens: 8192,
-      stream: body.stream !== false
+      stream: true
     };
 
     let response;
@@ -147,6 +150,9 @@ if (lastMsg === "/reset") {
     res.setHeader("Connection", "keep-alive");
     res.flushHeaders();
 
+    // instant keepalive chunk (prevents pgshag)
+    res.write(`data: {"choices":[{"delta":{"content":""}}]}\n\n`);
+
     let lastChunkTime = Date.now();
     let collectedText = "";
 
@@ -158,65 +164,66 @@ if (lastMsg === "/reset") {
     });
 
     const watchdog = setInterval(() => {
-      if (Date.now() - lastChunkTime > 90000) {
+      if (Date.now() - lastChunkTime > 120000) {
         response.data.destroy();
         res.end();
         clearInterval(watchdog);
       }
     }, 10000);
 
-    response.data.on("end", async () => {
+    response.data.on("end", () => {
       clearInterval(watchdog);
-
-      // MEMORY DETECTION PASS every ~20 turns
-      if (session.turn_counter >= 20) {
-        session.turn_counter = 0;
-
-        const detectPrompt = [
-          {
-            role: "system",
-            content:
-              "Detect if a permanent story memory occurred. Output ONE short line describing it or NONE."
-          },
-          {
-            role: "user",
-            content: collectedText.slice(-4000)
-          }
-        ];
-
-        try {
-          const detect = await axiosInstance.post(
-            GLM_ENDPOINT,
-            {
-              model: "zai-org/GLM-5-FP8",
-              messages: detectPrompt,
-              temperature: 0.3,
-              max_tokens: 200
-            },
-            {
-              headers: {
-                Authorization: `Bearer ${API_KEY}`,
-                "Content-Type": "application/json"
-              }
-            }
-          );
-
-          const suggestion =
-            detect.data.choices?.[0]?.message?.content?.trim();
-
-          if (suggestion && suggestion !== "NONE") {
-            session.pending_memory = suggestion;
-
-            res.write(
-              `data: {"choices":[{"delta":{"content":"\\n(OOC: Possible memory detected — ${suggestion}. Store permanently? Yes/No)"}}]}\n\n`
-            );
-          }
-        } catch {}
-      }
-
-      saveSession(convoId, session);
       res.end();
+
+      // Run memory detection AFTER stream closes
+      setImmediate(async () => {
+        try {
+          if (session.turn_counter >= 20) {
+            session.turn_counter = 0;
+
+            const detectPrompt = [
+              {
+                role: "system",
+                content:
+                  "Detect if a permanent story memory occurred. Output ONE short line or NONE."
+              },
+              {
+                role: "user",
+                content: collectedText.slice(-4000)
+              }
+            ];
+
+            const detect = await axiosInstance.post(
+              GLM_ENDPOINT,
+              {
+                model: "zai-org/GLM-5-FP8",
+                messages: detectPrompt,
+                temperature: 0.3,
+                max_tokens: 200
+              },
+              {
+                headers: {
+                  Authorization: `Bearer ${API_KEY}`,
+                  "Content-Type": "application/json"
+                }
+              }
+            );
+
+            const suggestion =
+              detect.data.choices?.[0]?.message?.content?.trim();
+
+            if (suggestion && suggestion !== "NONE") {
+              session.pending_memory = suggestion;
+            }
+          }
+
+          saveSession(convoId, session);
+        } catch (e) {
+          console.log("Memory detect error:", e.message);
+        }
+      });
     });
+
   } catch (err) {
     console.error(err.message);
     res.status(500).json({ error: "proxy failure" });
