@@ -60,7 +60,21 @@ app.post("/v1/chat/completions", async (req, res) => {
     const body = req.body;
     const convoId = getConversationId(body);
     const session = loadSession(convoId);
+const lastMsg = body.messages?.slice(-1)[0]?.content?.trim().toLowerCase();
 
+if (lastMsg === "/reset") {
+  const file = sessionFile(convoId);
+  if (fs.existsSync(file)) fs.unlinkSync(file);
+
+  return res.json({
+    choices: [{
+      message: {
+        role: "assistant",
+        content: "(OOC: Memory reset for this conversation.)"
+      }
+    }]
+  });
+}
     const lastMsg = body.messages?.slice(-1)[0]?.content || "";
 
     // Handle confirmation reply
