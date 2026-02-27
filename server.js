@@ -7,7 +7,7 @@ const cors = require("cors");
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: "10mb" }));
+app.use(express.json({ limit: "20mb" }));
 
 const PORT = process.env.PORT || 10000;
 const API_KEY = process.env.GLM_API_KEY;
@@ -15,9 +15,10 @@ const MASTER_PROMPT = process.env.MASTER_PROMPT || "";
 
 const GLM_ENDPOINT = "https://api.us-west-2.modal.direct/v1/chat/completions";
 
-const axiosInstance = axios.create({
-  timeout: 180000
-});
+const TOKEN_THRESHOLD = 100000; // ~100k trigger
+const RECENT_KEEP_RATIO = 0.35; // keep newest 35% raw
+
+const axiosInstance = axios.create({ timeout: 240000 });
 
 const SESS_DIR = path.join(__dirname, "sessions");
 if (!fs.existsSync(SESS_DIR)) fs.mkdirSync(SESS_DIR);
@@ -31,9 +32,9 @@ function loadSession(id) {
   if (fs.existsSync(f)) return JSON.parse(fs.readFileSync(f));
 
   return {
-    canon: [],
-    turn_counter: 0,
-    pending_memory: null
+    structured_memory: null,
+    compression_pending: false,
+    messages: []
   };
 }
 
@@ -47,12 +48,68 @@ function getConversationId(body) {
   return crypto.createHash("sha256").update(base).digest("hex");
 }
 
-function extractYesNo(text) {
-  if (!text) return null;
-  const t = text.trim().toLowerCase();
-  if (t === "yes" || t === "y") return true;
-  if (t === "no" || t === "n") return false;
-  return null;
+function estimateTokens(messages) {
+  const text = JSON.stringify(messages);
+  return Math.floor(text.length / 4);
+}
+
+async function buildStructuredMemory(oldMemory, earlyMessages) {
+  const prompt = [
+    {
+      role: "system",
+      content: `
+Rewrite the complete story memory in structured format.
+
+Preserve:
+- All major events chronologically
+- All secrets/confessions in detail
+- All preferences and traits
+- Emotional shifts
+- Symbolic actions
+- Unresolved threads
+
+Do not omit named events.
+Do not generalize important details.
+
+Format as:
+
+CORE STORY EVENTS:
+RELATIONSHIP PROGRESSION:
+SECRETS & CONFESSIONS:
+TRAITS & PREFERENCES:
+SYMBOLIC MARKERS:
+UNRESOLVED THREADS:
+`
+    },
+    {
+      role: "user",
+      content: `
+Existing Memory:
+${oldMemory || "None"}
+
+Early Conversation:
+${JSON.stringify(earlyMessages)}
+`
+    }
+  ];
+
+  const response = await axiosInstance.post(
+    GLM_ENDPOINT,
+    {
+      model: "zai-org/GLM-5-FP8",
+      messages: prompt,
+      temperature: 0.2,
+      max_tokens: 12000
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${API_KEY}`,
+        "Content-Type": "application/json"
+      }
+    }
+  );
+
+  return response.data.choices[0].message.content;
 }
 
 app.post("/v1/chat/completions", async (req, res) => {
@@ -60,176 +117,129 @@ app.post("/v1/chat/completions", async (req, res) => {
     const body = req.body;
     const convoId = getConversationId(body);
 
-    // 🔥 RESET COMMAND
-    const lastMsgRaw = body.messages?.slice(-1)[0]?.content || "";
-    const lastMsg = lastMsgRaw.trim().toLowerCase();
+    const lastMsg = body.messages?.slice(-1)[0]?.content?.trim().toLowerCase();
 
     if (lastMsg === "/reset") {
       const file = sessionFile(convoId);
       if (fs.existsSync(file)) fs.unlinkSync(file);
+      return res.json({
+        choices: [{ message: { role: "assistant", content: "(OOC: Memory reset.)" } }]
+      });
+    }
+
+    const session = loadSession(convoId);
+
+    // Save full raw history
+    session.messages = body.messages;
+
+    const estimatedTokens = estimateTokens(session.messages);
+
+    // If threshold crossed and not already pending
+    if (
+      estimatedTokens > TOKEN_THRESHOLD &&
+      !session.compression_pending &&
+      !session.structured_memory
+    ) {
+      session.compression_pending = true;
+      saveSession(convoId, session);
 
       return res.json({
         choices: [
           {
             message: {
               role: "assistant",
-              content: "(OOC: Memory reset for this conversation.)"
+              content:
+                "(OOC: Long-context threshold reached. Compress early arcs into structured long-term memory? Yes / No)"
             }
           }
         ]
       });
     }
 
-    const session = loadSession(convoId);
+    // Handle compression confirmation
+    if (session.compression_pending) {
+      if (lastMsg === "yes") {
+        const splitIndex = Math.floor(session.messages.length * (1 - RECENT_KEEP_RATIO));
+        const early = session.messages.slice(0, splitIndex);
+        const recent = session.messages.slice(splitIndex);
 
-    // Handle memory confirmation
-    if (session.pending_memory) {
-      const decision = extractYesNo(lastMsgRaw);
-      if (decision === true) {
-        session.canon.push(session.pending_memory);
+        const newMemory = await buildStructuredMemory(
+          session.structured_memory,
+          early
+        );
+
+        session.structured_memory = newMemory;
+        session.messages = recent;
+        session.compression_pending = false;
+        saveSession(convoId, session);
+
+        return res.json({
+          choices: [
+            {
+              message: {
+                role: "assistant",
+                content: "(OOC: Compression complete. Continuing RP.)"
+              }
+            }
+          ]
+        });
       }
-      session.pending_memory = null;
-      saveSession(convoId, session);
+
+      if (lastMsg === "no") {
+        session.compression_pending = false;
+        saveSession(convoId, session);
+      }
     }
 
-    session.turn_counter++;
-
-    const recent = body.messages.slice(-100);
-
-    const memoryBlock = session.canon.length
-      ? "CANON MEMORY:\n" + session.canon.map(x => "- " + x).join("\n")
-      : "";
-
+    // Build final prompt
     const finalMessages = [];
 
     if (MASTER_PROMPT) {
+      finalMessages.push({ role: "system", content: MASTER_PROMPT });
+    }
+
+    if (session.structured_memory) {
       finalMessages.push({
         role: "system",
-        content: MASTER_PROMPT
+        content: "LONG-TERM MEMORY:\n" + session.structured_memory
       });
     }
 
-    if (memoryBlock) {
-      finalMessages.push({
-        role: "system",
-        content: memoryBlock
-      });
-    }
-
-    finalMessages.push(...recent);
+    finalMessages.push(...session.messages);
 
     const finalBody = {
       ...body,
       messages: finalMessages,
-      max_tokens: 8192,
-      stream: true
+      stream: true,
+      max_tokens: 8192
     };
 
-    let response;
-
-    for (let attempt = 1; attempt <= 2; attempt++) {
-      try {
-        response = await axiosInstance({
-          method: "post",
-          url: GLM_ENDPOINT,
-          data: finalBody,
-          responseType: "stream",
-          headers: {
-            Authorization: `Bearer ${API_KEY}`,
-            "Content-Type": "application/json"
-          }
-        });
-        break;
-      } catch (e) {
-        if (attempt === 2) throw e;
+    const response = await axiosInstance({
+      method: "post",
+      url: GLM_ENDPOINT,
+      data: finalBody,
+      responseType: "stream",
+      headers: {
+        Authorization: `Bearer ${API_KEY}`,
+        "Content-Type": "application/json"
       }
-    }
+    });
 
     res.setHeader("Content-Type", "text/event-stream");
     res.setHeader("Cache-Control", "no-cache");
     res.setHeader("Connection", "keep-alive");
     res.flushHeaders();
 
-    // instant keepalive chunk (prevents pgshag)
     res.write(`data: {"choices":[{"delta":{"content":""}}]}\n\n`);
 
-    let lastChunkTime = Date.now();
-    let collectedText = "";
-
-    response.data.on("data", chunk => {
-      lastChunkTime = Date.now();
-      const str = chunk.toString();
-      collectedText += str;
-      res.write(chunk);
-    });
-
-    const watchdog = setInterval(() => {
-      if (Date.now() - lastChunkTime > 120000) {
-        response.data.destroy();
-        res.end();
-        clearInterval(watchdog);
-      }
-    }, 10000);
-
-    response.data.on("end", () => {
-      clearInterval(watchdog);
-      res.end();
-
-      // Run memory detection AFTER stream closes
-      setImmediate(async () => {
-        try {
-          if (session.turn_counter >= 20) {
-            session.turn_counter = 0;
-
-            const detectPrompt = [
-              {
-                role: "system",
-                content:
-                  "Detect if a permanent story memory occurred. Output ONE short line or NONE."
-              },
-              {
-                role: "user",
-                content: collectedText.slice(-4000)
-              }
-            ];
-
-            const detect = await axiosInstance.post(
-              GLM_ENDPOINT,
-              {
-                model: "zai-org/GLM-5-FP8",
-                messages: detectPrompt,
-                temperature: 0.3,
-                max_tokens: 200
-              },
-              {
-                headers: {
-                  Authorization: `Bearer ${API_KEY}`,
-                  "Content-Type": "application/json"
-                }
-              }
-            );
-
-            const suggestion =
-              detect.data.choices?.[0]?.message?.content?.trim();
-
-            if (suggestion && suggestion !== "NONE") {
-              session.pending_memory = suggestion;
-            }
-          }
-
-          saveSession(convoId, session);
-        } catch (e) {
-          console.log("Memory detect error:", e.message);
-        }
-      });
-    });
+    response.data.pipe(res);
 
   } catch (err) {
-    console.error(err.message);
+    console.error(err);
     res.status(500).json({ error: "proxy failure" });
   }
 });
 
 app.listen(PORT, () => {
-  console.log("Server running");
+  console.log("Structured Memory Engine Running");
 });
