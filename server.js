@@ -15,8 +15,8 @@ const MASTER_PROMPT = process.env.MASTER_PROMPT || "";
 
 const GLM_ENDPOINT = "https://api.us-west-2.modal.direct/v1/chat/completions";
 
-const TOKEN_THRESHOLD = 100000; // ~100k trigger
-const RECENT_KEEP_RATIO = 0.35; // keep newest 35% raw
+const TOKEN_THRESHOLD = 100000;
+const RECENT_KEEP_RATIO = 0.35;
 
 const axiosInstance = axios.create({ timeout: 240000 });
 
@@ -129,12 +129,10 @@ app.post("/v1/chat/completions", async (req, res) => {
 
     const session = loadSession(convoId);
 
-    // Save full raw history
     session.messages = body.messages;
 
     const estimatedTokens = estimateTokens(session.messages);
 
-    // If threshold crossed and not already pending
     if (
       estimatedTokens > TOKEN_THRESHOLD &&
       !session.compression_pending &&
@@ -156,7 +154,6 @@ app.post("/v1/chat/completions", async (req, res) => {
       });
     }
 
-    // Handle compression confirmation
     if (session.compression_pending) {
       if (lastMsg === "yes") {
         const splitIndex = Math.floor(session.messages.length * (1 - RECENT_KEEP_RATIO));
@@ -191,7 +188,6 @@ app.post("/v1/chat/completions", async (req, res) => {
       }
     }
 
-    // Build final prompt
     const finalMessages = [];
 
     if (MASTER_PROMPT) {
@@ -230,9 +226,21 @@ app.post("/v1/chat/completions", async (req, res) => {
     res.setHeader("Connection", "keep-alive");
     res.flushHeaders();
 
+    res.write(": ping\n\n");
     res.write(`data: {"choices":[{"delta":{"content":""}}]}\n\n`);
 
-    response.data.pipe(res);
+    response.data.on("data", (chunk) => {
+      res.write(chunk);
+    });
+
+    response.data.on("end", () => {
+      res.write("data: [DONE]\n\n");
+      res.end();
+    });
+
+    response.data.on("error", () => {
+      res.end();
+    });
 
   } catch (err) {
     console.error(err);
@@ -241,5 +249,5 @@ app.post("/v1/chat/completions", async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log("Structured Memory Engine Running");
+  console.log("Structured Memory Engine Running v2.1");
 });
