@@ -4,7 +4,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 const cors = require("cors");
-
+console.log("Node version:", process.version);
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: "20mb" }));
