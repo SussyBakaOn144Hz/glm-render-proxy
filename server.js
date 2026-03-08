@@ -1,10 +1,9 @@
 const express = require("express");
-const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 const cors = require("cors");
-console.log("Node version:", process.version);
+
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: "20mb" }));
@@ -17,8 +16,6 @@ const GLM_ENDPOINT = "https://api.us-west-2.modal.direct/v1/chat/completions";
 
 const TOKEN_THRESHOLD = 100000;
 const RECENT_KEEP_RATIO = 0.35;
-
-const axiosInstance = axios.create({ timeout: 240000 });
 
 const SESS_DIR = path.join(__dirname, "sessions");
 if (!fs.existsSync(SESS_DIR)) fs.mkdirSync(SESS_DIR);
@@ -93,23 +90,41 @@ ${JSON.stringify(earlyMessages)}
     }
   ];
 
-  const response = await axiosInstance.post(
-    GLM_ENDPOINT,
-    {
+  const response = await fetch(GLM_ENDPOINT, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${API_KEY}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
       model: "zai-org/GLM-5-FP8",
       messages: prompt,
       temperature: 0.2,
       max_tokens: 12000
-    },
-    {
-      headers: {
-        Authorization: `Bearer ${API_KEY}`,
-        "Content-Type": "application/json"
-      }
-    }
-  );
+    })
+  });
 
-  return response.data.choices[0].message.content;
+  const data = await response.json();
+  return data.choices[0].message.content;
+}
+
+async function callModel(body) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const response = await fetch(GLM_ENDPOINT, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${API_KEY}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(body)
+      });
+
+      if (response.ok) return response;
+    } catch (err) {
+      if (attempt === 1) throw err;
+    }
+  }
 }
 
 app.post("/v1/chat/completions", async (req, res) => {
@@ -207,19 +222,10 @@ app.post("/v1/chat/completions", async (req, res) => {
       ...body,
       messages: finalMessages,
       stream: true,
-      max_tokens: 8192
+      max_tokens: 4096
     };
 
-    const response = await axiosInstance({
-      method: "post",
-      url: GLM_ENDPOINT,
-      data: finalBody,
-      responseType: "stream",
-      headers: {
-        Authorization: `Bearer ${API_KEY}`,
-        "Content-Type": "application/json"
-      }
-    });
+    const response = await callModel(finalBody);
 
     res.setHeader("Content-Type", "text/event-stream");
     res.setHeader("Cache-Control", "no-cache");
@@ -227,20 +233,18 @@ app.post("/v1/chat/completions", async (req, res) => {
     res.flushHeaders();
 
     res.write(": ping\n\n");
-    res.write(`data: {"choices":[{"delta":{"content":""}}]}\n\n`);
 
-    response.data.on("data", (chunk) => {
-      res.write(chunk);
-    });
+    const reader = response.body.getReader();
 
-    response.data.on("end", () => {
-      res.write("data: [DONE]\n\n");
-      res.end();
-    });
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
 
-    response.data.on("error", () => {
-      res.end();
-    });
+      res.write(Buffer.from(value));
+    }
+
+    res.write("data: [DONE]\n\n");
+    res.end();
 
   } catch (err) {
     console.error(err);
@@ -248,6 +252,10 @@ app.post("/v1/chat/completions", async (req, res) => {
   }
 });
 
+app.get("/ping", (req, res) => {
+  res.send("alive");
+});
+
 app.listen(PORT, () => {
-  console.log("Structured Memory Engine Running v2.1");
+  console.log("Structured Memory Engine Running v2.2");
 });
