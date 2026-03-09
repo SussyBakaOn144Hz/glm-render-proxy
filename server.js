@@ -1,9 +1,9 @@
 const express = require("express");
+const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 const cors = require("cors");
-const https = require("https");
 
 const app = express();
 app.use(cors());
@@ -13,16 +13,16 @@ const PORT = process.env.PORT || 10000;
 const API_KEY = process.env.GLM_API_KEY;
 const MASTER_PROMPT = process.env.MASTER_PROMPT || "";
 
-const HOST = "api.us-west-2.modal.direct";
-const PATH_API = "/v1/chat/completions";
-
-const TOKEN_THRESHOLD = 100000;
-const RECENT_KEEP_RATIO = 0.35;
+const GLM_ENDPOINT = "https://api.us-west-2.modal.direct/v1/chat/completions";
 
 const SESS_DIR = path.join(__dirname, "sessions");
 if (!fs.existsSync(SESS_DIR)) fs.mkdirSync(SESS_DIR);
 
 const activeStreams = new Map();
+
+const axiosInstance = axios.create({
+  timeout: 240000
+});
 
 function sessionFile(id) {
   return path.join(SESS_DIR, `${id}.json`);
@@ -49,106 +49,52 @@ function getConversationId(body) {
   return crypto.createHash("sha256").update(base).digest("hex");
 }
 
-function estimateTokens(messages) {
-  const text = JSON.stringify(messages);
-  return Math.floor(text.length / 4);
-}
+async function callModel(body) {
 
-function streamToModel(payload, res, convoId) {
-  const data = JSON.stringify(payload);
+  for (let attempt = 0; attempt < 2; attempt++) {
 
-  const options = {
-    hostname: HOST,
-    path: PATH_API,
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${API_KEY}`,
-      "Content-Type": "application/json",
-      "Content-Length": Buffer.byteLength(data)
+    try {
+
+      const response = await axiosInstance.post(
+        GLM_ENDPOINT,
+        body,
+        {
+          headers: {
+            Authorization: `Bearer ${API_KEY}`,
+            "Content-Type": "application/json"
+          },
+          responseType: "stream"
+        }
+      );
+
+      return response;
+
+    } catch (err) {
+
+      if (attempt === 1) throw err;
+
     }
-  };
 
-  const upstream = https.request(options, (response) => {
+  }
 
-    response.on("data", (chunk) => {
-      res.write(chunk);
-    });
-
-    response.on("end", () => {
-      res.write("data: [DONE]\n\n");
-      res.end();
-      activeStreams.delete(convoId);
-    });
-
-  });
-
-  upstream.on("error", (err) => {
-    console.error("Upstream error:", err);
-    res.end();
-    activeStreams.delete(convoId);
-  });
-
-  upstream.write(data);
-  upstream.end();
 }
 
 app.post("/v1/chat/completions", async (req, res) => {
+
   try {
 
     const body = req.body;
     const convoId = getConversationId(body);
 
     if (activeStreams.has(convoId)) {
-      try {
-        activeStreams.get(convoId).end();
-      } catch {}
+      try { activeStreams.get(convoId).end(); } catch {}
     }
 
     activeStreams.set(convoId, res);
 
-    const lastMsg = body.messages?.slice(-1)[0]?.content?.trim().toLowerCase();
-
-    if (lastMsg === "/reset") {
-      const file = sessionFile(convoId);
-      if (fs.existsSync(file)) fs.unlinkSync(file);
-      return res.json({
-        choices: [{ message: { role: "assistant", content: "(OOC: Memory reset.)" } }]
-      });
-    }
-
     const session = loadSession(convoId);
 
     session.messages = body.messages;
-
-    const estimatedTokens = estimateTokens(session.messages);
-
-    if (
-      estimatedTokens > TOKEN_THRESHOLD &&
-      !session.compression_pending &&
-      !session.structured_memory
-    ) {
-
-      session.compression_pending = true;
-      saveSession(convoId, session);
-
-      return res.json({
-        choices: [
-          {
-            message: {
-              role: "assistant",
-              content:
-                "(OOC: Long-context threshold reached. Compress early arcs into structured memory? Yes / No)"
-            }
-          }
-        ]
-      });
-    }
-
-    if (session.compression_pending) {
-      if (lastMsg === "no") {
-        session.compression_pending = false;
-      }
-    }
 
     saveSession(convoId, session);
 
@@ -167,12 +113,14 @@ app.post("/v1/chat/completions", async (req, res) => {
 
     finalMessages.push(...session.messages);
 
-    const payload = {
+    const finalBody = {
       ...body,
       messages: finalMessages,
       stream: true,
       max_tokens: 900
     };
+
+    const upstream = await callModel(finalBody);
 
     res.setHeader("Content-Type", "text/event-stream");
     res.setHeader("Cache-Control", "no-cache");
@@ -180,20 +128,34 @@ app.post("/v1/chat/completions", async (req, res) => {
     res.flushHeaders();
 
     const heartbeat = setInterval(() => {
-      res.write(": heartbeat\n\n");
+      res.write(": ping\n\n");
     }, 3000);
 
-    res.on("close", () => {
+    upstream.data.on("data", chunk => {
+      res.write(chunk);
+    });
+
+    upstream.data.on("end", () => {
       clearInterval(heartbeat);
+      res.write("data: [DONE]\n\n");
+      res.end();
       activeStreams.delete(convoId);
     });
 
-    streamToModel(payload, res, convoId);
+    upstream.data.on("error", err => {
+      clearInterval(heartbeat);
+      console.error(err);
+      res.end();
+      activeStreams.delete(convoId);
+    });
 
   } catch (err) {
+
     console.error(err);
     res.status(500).json({ error: "proxy failure" });
+
   }
+
 });
 
 app.get("/ping", (req, res) => {
@@ -201,5 +163,5 @@ app.get("/ping", (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log("LLM Proxy v2.3 running");
+  console.log("LLM Proxy v2.1 Axios Stable running");
 });
