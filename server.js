@@ -3,6 +3,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 const cors = require("cors");
+const https = require("https");
 
 const app = express();
 app.use(cors());
@@ -12,13 +13,16 @@ const PORT = process.env.PORT || 10000;
 const API_KEY = process.env.GLM_API_KEY;
 const MASTER_PROMPT = process.env.MASTER_PROMPT || "";
 
-const GLM_ENDPOINT = "https://api.us-west-2.modal.direct/v1/chat/completions";
+const HOST = "api.us-west-2.modal.direct";
+const PATH_API = "/v1/chat/completions";
 
 const TOKEN_THRESHOLD = 100000;
 const RECENT_KEEP_RATIO = 0.35;
 
 const SESS_DIR = path.join(__dirname, "sessions");
 if (!fs.existsSync(SESS_DIR)) fs.mkdirSync(SESS_DIR);
+
+const activeStreams = new Map();
 
 function sessionFile(id) {
   return path.join(SESS_DIR, `${id}.json`);
@@ -36,7 +40,7 @@ function loadSession(id) {
 }
 
 function saveSession(id, data) {
-  fs.writeFileSync(sessionFile(id), JSON.stringify(data, null, 2));
+  fs.writeFileSync(sessionFile(id), JSON.stringify(data));
 }
 
 function getConversationId(body) {
@@ -50,87 +54,57 @@ function estimateTokens(messages) {
   return Math.floor(text.length / 4);
 }
 
-async function buildStructuredMemory(oldMemory, earlyMessages) {
-  const prompt = [
-    {
-      role: "system",
-      content: `
-Rewrite the complete story memory in structured format.
+function streamToModel(payload, res, convoId) {
+  const data = JSON.stringify(payload);
 
-Preserve:
-- All major events chronologically
-- All secrets/confessions in detail
-- All preferences and traits
-- Emotional shifts
-- Symbolic actions
-- Unresolved threads
-
-Do not omit named events.
-Do not generalize important details.
-
-Format as:
-
-CORE STORY EVENTS:
-RELATIONSHIP PROGRESSION:
-SECRETS & CONFESSIONS:
-TRAITS & PREFERENCES:
-SYMBOLIC MARKERS:
-UNRESOLVED THREADS:
-`
-    },
-    {
-      role: "user",
-      content: `
-Existing Memory:
-${oldMemory || "None"}
-
-Early Conversation:
-${JSON.stringify(earlyMessages)}
-`
-    }
-  ];
-
-  const response = await fetch(GLM_ENDPOINT, {
+  const options = {
+    hostname: HOST,
+    path: PATH_API,
     method: "POST",
     headers: {
       Authorization: `Bearer ${API_KEY}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({
-      model: "zai-org/GLM-5-FP8",
-      messages: prompt,
-      temperature: 0.2,
-      max_tokens: 12000
-    })
+      "Content-Type": "application/json",
+      "Content-Length": Buffer.byteLength(data)
+    }
+  };
+
+  const upstream = https.request(options, (response) => {
+
+    response.on("data", (chunk) => {
+      res.write(chunk);
+    });
+
+    response.on("end", () => {
+      res.write("data: [DONE]\n\n");
+      res.end();
+      activeStreams.delete(convoId);
+    });
+
   });
 
-  const data = await response.json();
-  return data.choices[0].message.content;
-}
+  upstream.on("error", (err) => {
+    console.error("Upstream error:", err);
+    res.end();
+    activeStreams.delete(convoId);
+  });
 
-async function callModel(body) {
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      const response = await fetch(GLM_ENDPOINT, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${API_KEY}`,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify(body)
-      });
-
-      if (response.ok) return response;
-    } catch (err) {
-      if (attempt === 1) throw err;
-    }
-  }
+  upstream.write(data);
+  upstream.end();
 }
 
 app.post("/v1/chat/completions", async (req, res) => {
   try {
+
     const body = req.body;
     const convoId = getConversationId(body);
+
+    if (activeStreams.has(convoId)) {
+      try {
+        activeStreams.get(convoId).end();
+      } catch {}
+    }
+
+    activeStreams.set(convoId, res);
 
     const lastMsg = body.messages?.slice(-1)[0]?.content?.trim().toLowerCase();
 
@@ -153,6 +127,7 @@ app.post("/v1/chat/completions", async (req, res) => {
       !session.compression_pending &&
       !session.structured_memory
     ) {
+
       session.compression_pending = true;
       saveSession(convoId, session);
 
@@ -162,7 +137,7 @@ app.post("/v1/chat/completions", async (req, res) => {
             message: {
               role: "assistant",
               content:
-                "(OOC: Long-context threshold reached. Compress early arcs into structured long-term memory? Yes / No)"
+                "(OOC: Long-context threshold reached. Compress early arcs into structured memory? Yes / No)"
             }
           }
         ]
@@ -170,38 +145,12 @@ app.post("/v1/chat/completions", async (req, res) => {
     }
 
     if (session.compression_pending) {
-      if (lastMsg === "yes") {
-        const splitIndex = Math.floor(session.messages.length * (1 - RECENT_KEEP_RATIO));
-        const early = session.messages.slice(0, splitIndex);
-        const recent = session.messages.slice(splitIndex);
-
-        const newMemory = await buildStructuredMemory(
-          session.structured_memory,
-          early
-        );
-
-        session.structured_memory = newMemory;
-        session.messages = recent;
-        session.compression_pending = false;
-        saveSession(convoId, session);
-
-        return res.json({
-          choices: [
-            {
-              message: {
-                role: "assistant",
-                content: "(OOC: Compression complete. Continuing RP.)"
-              }
-            }
-          ]
-        });
-      }
-
       if (lastMsg === "no") {
         session.compression_pending = false;
-        saveSession(convoId, session);
       }
     }
+
+    saveSession(convoId, session);
 
     const finalMessages = [];
 
@@ -218,33 +167,28 @@ app.post("/v1/chat/completions", async (req, res) => {
 
     finalMessages.push(...session.messages);
 
-    const finalBody = {
+    const payload = {
       ...body,
       messages: finalMessages,
       stream: true,
-      max_tokens: 4096
+      max_tokens: 900
     };
-
-    const response = await callModel(finalBody);
 
     res.setHeader("Content-Type", "text/event-stream");
     res.setHeader("Cache-Control", "no-cache");
     res.setHeader("Connection", "keep-alive");
     res.flushHeaders();
 
-    res.write(": ping\n\n");
+    const heartbeat = setInterval(() => {
+      res.write(": heartbeat\n\n");
+    }, 3000);
 
-    const reader = response.body.getReader();
+    res.on("close", () => {
+      clearInterval(heartbeat);
+      activeStreams.delete(convoId);
+    });
 
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-
-      res.write(Buffer.from(value));
-    }
-
-    res.write("data: [DONE]\n\n");
-    res.end();
+    streamToModel(payload, res, convoId);
 
   } catch (err) {
     console.error(err);
@@ -257,5 +201,5 @@ app.get("/ping", (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log("Structured Memory Engine Running v2.2");
+  console.log("LLM Proxy v2.3 running");
 });
