@@ -117,7 +117,7 @@ app.post("/v1/chat/completions", async (req, res) => {
       ...body,
       messages: finalMessages,
       stream: true,
-      max_tokens: 900
+      max_tokens: 4096
     };
 
     const upstream = await callModel(finalBody);
