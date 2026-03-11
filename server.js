@@ -83,7 +83,7 @@ async function callModel(body) {
 
       if (attempt === 1) throw err;
 
-      console.log("Upstream retry...");
+      console.log("Retrying upstream...");
 
     }
 
@@ -96,7 +96,6 @@ app.post("/v1/chat/completions", async (req, res) => {
   try {
 
     const body = req.body;
-
     const convoId = getConversationId(body);
 
     if (activeStreams.has(convoId)) {
@@ -116,9 +115,7 @@ app.post("/v1/chat/completions", async (req, res) => {
       if (fs.existsSync(f)) fs.unlinkSync(f);
 
       return res.json({
-        choices: [
-          { message: { role: "assistant", content: "(OOC: Memory reset.)" } }
-        ]
+        choices: [{ message: { role: "assistant", content: "(OOC: Memory reset.)" } }]
       });
 
     }
@@ -133,14 +130,12 @@ app.post("/v1/chat/completions", async (req, res) => {
       };
 
       return res.json({
-        choices: [
-          {
-            message: {
-              role: "assistant",
-              content: `(OOC: Stats)\n${JSON.stringify(stats, null, 2)}`
-            }
+        choices: [{
+          message: {
+            role: "assistant",
+            content: `(OOC: Stats)\n${JSON.stringify(stats, null, 2)}`
           }
-        ]
+        }]
       });
 
     }
@@ -148,14 +143,12 @@ app.post("/v1/chat/completions", async (req, res) => {
     if (lastMsg === "/memory") {
 
       return res.json({
-        choices: [
-          {
-            message: {
-              role: "assistant",
-              content: `(OOC: Memory)\n${session.structured_memory || "No memory stored"}`
-            }
+        choices: [{
+          message: {
+            role: "assistant",
+            content: `(OOC: Memory)\n${session.structured_memory || "No memory stored"}`
           }
-        ]
+        }]
       });
 
     }
@@ -167,6 +160,7 @@ app.post("/v1/chat/completions", async (req, res) => {
     const finalMessages = [];
 
     if (MASTER_PROMPT) {
+
       finalMessages.push({
         role: "system",
         content: MASTER_PROMPT
@@ -177,11 +171,12 @@ app.post("/v1/chat/completions", async (req, res) => {
         content: `
 Characters should naturally take initiative and advance scenes through actions or dialogue.
 
-Dialogue should dominate over narration in most scenes.
+Dialogue should dominate over narration.
 
-Each response should move the scene forward through action, tension, or emotional shift.
+Each response should move the scene forward through action, emotional shift, or tension.
 `
       });
+
     }
 
     if (session.structured_memory) {
@@ -213,40 +208,31 @@ Each response should move the scene forward through action, tension, or emotiona
       res.write(": ping\n\n");
     }, 3000);
 
-    let finished = false;
-
     upstream.data.on("data", chunk => {
 
       const text = chunk.toString();
 
+      if (!res.writableEnded) {
+        res.write(chunk);
+      }
+
       if (text.includes("[DONE]")) {
-        finished = true;
+
+        clearInterval(heartbeat);
+
+        res.end();
+
+        activeStreams.delete(convoId);
+
       }
-
-      res.write(chunk);
-
-    });
-
-    upstream.data.on("end", () => {
-
-      if (!finished) {
-        console.log("Upstream ended early, keeping connection alive");
-    return;
-      }
-
-      clearInterval(heartbeat);
-
-      res.end();
-
-      activeStreams.delete(convoId);
 
     });
 
     upstream.data.on("error", err => {
 
-      clearInterval(heartbeat);
-
       console.error(err);
+
+      clearInterval(heartbeat);
 
       res.end();
 
@@ -273,7 +259,7 @@ app.listen(PORT, () => {
 });
 
 
-// warm ping to prevent cold start
+// Warm ping to prevent Render sleep
 
 setInterval(async () => {
 
@@ -281,6 +267,6 @@ setInterval(async () => {
 
     await axios.get(`http://localhost:${PORT}/ping`);
 
-  } catch (e) {}
+  } catch {}
 
 }, 240000);
