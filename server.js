@@ -22,8 +22,6 @@ const axiosInstance = axios.create({
 const SESS_DIR = path.join(__dirname, "sessions");
 if (!fs.existsSync(SESS_DIR)) fs.mkdirSync(SESS_DIR);
 
-const activeStreams = new Map();
-
 function sessionFile(id) {
   return path.join(SESS_DIR, `${id}.json`);
 }
@@ -64,12 +62,6 @@ app.post("/v1/chat/completions", async (req, res) => {
 
     const body = req.body;
     const convoId = getConversationId(body);
-
-    if (activeStreams.has(convoId)) {
-      try { activeStreams.get(convoId).end(); } catch {}
-    }
-
-    activeStreams.set(convoId, res);
 
     const lastMsg = body.messages?.slice(-1)[0]?.content?.trim().toLowerCase();
 
@@ -121,6 +113,7 @@ app.post("/v1/chat/completions", async (req, res) => {
     }
 
     session.messages = body.messages;
+
     saveSession(convoId, session);
 
     const finalMessages = [];
@@ -161,34 +154,10 @@ app.post("/v1/chat/completions", async (req, res) => {
     );
 
     res.setHeader("Content-Type", "text/event-stream");
-    res.setHeader("Cache-Control", "no-cache, no-transform");
+    res.setHeader("Cache-Control", "no-cache");
     res.setHeader("Connection", "keep-alive");
 
-    res.flushHeaders();
-
-    upstream.data.on("data", chunk => {
-
-      if (!res.writableEnded) {
-        res.write(chunk);
-      }
-
-    });
-
-    upstream.data.on("end", () => {
-
-      res.end();
-      activeStreams.delete(convoId);
-
-    });
-
-    upstream.data.on("error", err => {
-
-      console.error(err);
-
-      res.end();
-      activeStreams.delete(convoId);
-
-    });
+    upstream.data.pipe(res);
 
   } catch (err) {
 
@@ -207,7 +176,7 @@ app.get("/ping", (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log("LLM Proxy v2.5 running");
+  console.log("LLM Proxy running");
 });
 
 setInterval(async () => {
