@@ -15,14 +15,14 @@ const MASTER_PROMPT = process.env.MASTER_PROMPT || "";
 
 const GLM_ENDPOINT = "https://api.us-west-2.modal.direct/v1/chat/completions";
 
+const axiosInstance = axios.create({
+  timeout: 240000
+});
+
 const SESS_DIR = path.join(__dirname, "sessions");
 if (!fs.existsSync(SESS_DIR)) fs.mkdirSync(SESS_DIR);
 
 const activeStreams = new Map();
-
-const axiosInstance = axios.create({
-  timeout: 240000
-});
 
 function sessionFile(id) {
   return path.join(SESS_DIR, `${id}.json`);
@@ -30,7 +30,10 @@ function sessionFile(id) {
 
 function loadSession(id) {
   const f = sessionFile(id);
-  if (fs.existsSync(f)) return JSON.parse(fs.readFileSync(f));
+
+  if (fs.existsSync(f)) {
+    return JSON.parse(fs.readFileSync(f));
+  }
 
   return {
     structured_memory: null,
@@ -45,8 +48,15 @@ function saveSession(id, data) {
 
 function getConversationId(body) {
   if (body.conversation_id) return body.conversation_id;
+
   const base = body.messages?.[0]?.content || "default";
+
   return crypto.createHash("sha256").update(base).digest("hex");
+}
+
+function estimateTokens(messages) {
+  const text = JSON.stringify(messages);
+  return Math.floor(text.length / 4);
 }
 
 async function callModel(body) {
@@ -73,6 +83,8 @@ async function callModel(body) {
 
       if (attempt === 1) throw err;
 
+      console.log("Upstream retry...");
+
     }
 
   }
@@ -84,6 +96,7 @@ app.post("/v1/chat/completions", async (req, res) => {
   try {
 
     const body = req.body;
+
     const convoId = getConversationId(body);
 
     if (activeStreams.has(convoId)) {
@@ -92,7 +105,60 @@ app.post("/v1/chat/completions", async (req, res) => {
 
     activeStreams.set(convoId, res);
 
+    const lastMsg = body.messages?.slice(-1)[0]?.content?.trim().toLowerCase();
+
     const session = loadSession(convoId);
+
+    if (lastMsg === "/reset") {
+
+      const f = sessionFile(convoId);
+
+      if (fs.existsSync(f)) fs.unlinkSync(f);
+
+      return res.json({
+        choices: [
+          { message: { role: "assistant", content: "(OOC: Memory reset.)" } }
+        ]
+      });
+
+    }
+
+    if (lastMsg === "/stats") {
+
+      const stats = {
+        session_id: convoId,
+        messages: session.messages.length,
+        estimated_tokens: estimateTokens(session.messages),
+        memory_present: !!session.structured_memory
+      };
+
+      return res.json({
+        choices: [
+          {
+            message: {
+              role: "assistant",
+              content: `(OOC: Stats)\n${JSON.stringify(stats, null, 2)}`
+            }
+          }
+        ]
+      });
+
+    }
+
+    if (lastMsg === "/memory") {
+
+      return res.json({
+        choices: [
+          {
+            message: {
+              role: "assistant",
+              content: `(OOC: Memory)\n${session.structured_memory || "No memory stored"}`
+            }
+          }
+        ]
+      });
+
+    }
 
     session.messages = body.messages;
 
@@ -101,14 +167,30 @@ app.post("/v1/chat/completions", async (req, res) => {
     const finalMessages = [];
 
     if (MASTER_PROMPT) {
-      finalMessages.push({ role: "system", content: MASTER_PROMPT });
+      finalMessages.push({
+        role: "system",
+        content: MASTER_PROMPT
+      });
+
+      finalMessages.push({
+        role: "system",
+        content: `
+Characters should naturally take initiative and advance scenes through actions or dialogue.
+
+Dialogue should dominate over narration in most scenes.
+
+Each response should move the scene forward through action, tension, or emotional shift.
+`
+      });
     }
 
     if (session.structured_memory) {
+
       finalMessages.push({
         role: "system",
         content: "LONG-TERM MEMORY:\n" + session.structured_memory
       });
+
     }
 
     finalMessages.push(...session.messages);
@@ -117,7 +199,7 @@ app.post("/v1/chat/completions", async (req, res) => {
       ...body,
       messages: finalMessages,
       stream: true,
-      max_tokens: 4096
+      max_tokens: 1500
     };
 
     const upstream = await callModel(finalBody);
@@ -131,27 +213,50 @@ app.post("/v1/chat/completions", async (req, res) => {
       res.write(": ping\n\n");
     }, 3000);
 
+    let finished = false;
+
     upstream.data.on("data", chunk => {
+
+      const text = chunk.toString();
+
+      if (text.includes("[DONE]")) {
+        finished = true;
+      }
+
       res.write(chunk);
+
     });
 
     upstream.data.on("end", () => {
+
+      if (!finished) {
+        res.write("data: [DONE]\n\n");
+      }
+
       clearInterval(heartbeat);
-      res.write("data: [DONE]\n\n");
+
       res.end();
+
       activeStreams.delete(convoId);
+
     });
 
     upstream.data.on("error", err => {
+
       clearInterval(heartbeat);
+
       console.error(err);
+
       res.end();
+
       activeStreams.delete(convoId);
+
     });
 
   } catch (err) {
 
     console.error(err);
+
     res.status(500).json({ error: "proxy failure" });
 
   }
@@ -163,5 +268,18 @@ app.get("/ping", (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log("LLM Proxy v2.1 Axios Stable running");
+  console.log("LLM Proxy v2.4 running");
 });
+
+
+// warm ping to prevent cold start
+
+setInterval(async () => {
+
+  try {
+
+    await axios.get(`http://localhost:${PORT}/ping`);
+
+  } catch (e) {}
+
+}, 240000);
