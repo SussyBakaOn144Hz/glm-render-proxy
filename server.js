@@ -7,42 +7,33 @@ const cors = require("cors");
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: "50mb" })); // Increased to 50mb to safely handle 100k+ tokens
+app.use(express.json({ limit: "50mb" }));
 
 const PORT = process.env.PORT || 10000;
 const API_KEY = process.env.GLM_API_KEY;
 const MASTER_PROMPT = process.env.MASTER_PROMPT || "";
 const GLM_ENDPOINT = "https://api.us-west-2.modal.direct/v1/chat/completions";
 
-const axiosInstance = axios.create({
-  timeout: 240000 // 4 minutes
-});
+const axiosInstance = axios.create({ timeout: 240000 });
 
 const SESS_DIR = path.join(__dirname, "sessions");
 if (!fs.existsSync(SESS_DIR)) fs.mkdirSync(SESS_DIR);
 
 const activeStreams = new Map();
 
-// --- SESSION MANAGEMENT ---
-function sessionFile(id) {
-  return path.join(SESS_DIR, `${id}.json`);
-}
+// --- HELPERS ---
+function sessionFile(id) { return path.join(SESS_DIR, `${id}.json`); }
 
 function loadSession(id) {
   const f = sessionFile(id);
-  if (fs.existsSync(f)) {
-    return JSON.parse(fs.readFileSync(f));
-  }
-  return {
+  return fs.existsSync(f) ? JSON.parse(fs.readFileSync(f)) : {
     structured_memory: null,
     compression_pending: false,
-    hidden_message_count: 0 // Tracks how many messages have been compressed to avoid loops
+    hidden_message_count: 0
   };
 }
 
-function saveSession(id, data) {
-  fs.writeFileSync(sessionFile(id), JSON.stringify(data));
-}
+function saveSession(id, data) { fs.writeFileSync(sessionFile(id), JSON.stringify(data)); }
 
 function getConversationId(body) {
   if (body.conversation_id) return body.conversation_id;
@@ -51,20 +42,15 @@ function getConversationId(body) {
 }
 
 function estimateTokens(messages) {
-  if (!messages || messages.length === 0) return 0;
-  const text = JSON.stringify(messages);
-  return Math.floor(text.length / 4);
+  return messages ? Math.floor(JSON.stringify(messages).length / 4) : 0;
 }
 
-// --- UPSTREAM CALLER ---
+// --- CORE UPSTREAM ---
 async function callModel(body) {
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       return await axiosInstance.post(GLM_ENDPOINT, body, {
-        headers: {
-          Authorization: `Bearer ${API_KEY}`,
-          "Content-Type": "application/json"
-        },
+        headers: { Authorization: `Bearer ${API_KEY}`, "Content-Type": "application/json" },
         responseType: body.stream ? "stream" : "json"
       });
     } catch (err) {
@@ -74,90 +60,50 @@ async function callModel(body) {
   }
 }
 
-// --- MEMORY COMPRESSION ENGINE ---
+// --- MEMORY ENGINE ---
 async function updateStructuredMemory(messagesToCompress, currentMemory, modelName) {
-  const memoryPrompt = `
-You are a professional narrative archivist. Below is a portion of a roleplay history.
-Your task is to update the LONG-TERM MEMORY ledger.
-
-CRITICAL INSTRUCTIONS:
-1. PRIORITIZE: Fine details, secrets, specific likes/dislikes, and recent behavioral changes.
-2. TRACK: Relationship transformations (e.g., shifts in trust, romance, or hostility).
-3. RETAIN: Significant plot milestones, physical transformations, or permanent changes to the world.
-4. FORMAT: Keep it as a highly structured, dense list of facts. Do not write a summary paragraph.
-
-Current Memory Ledger:
-${currentMemory || "No existing memory."}
-
-New History to Process:
-${JSON.stringify(messagesToCompress)}
-
-Output ONLY the updated Long-Term Memory ledger.
-  `;
+  const memoryPrompt = `Update the LONG-TERM MEMORY ledger. PRIORITIZE: Secrets, fine details, likes/dislikes, and relationship transformations. RETAIN: Significant milestones and character changes. Output ONLY a dense, structured list of facts.\n\nOld Memory: ${currentMemory || "None"}\n\nNew Data: ${JSON.stringify(messagesToCompress)}`;
 
   try {
-    const response = await callModel({
+    const res = await callModel({
       model: modelName || "glm-5",
       messages: [{ role: "system", content: memoryPrompt }],
       stream: false,
       max_tokens: 2048
     });
-    return response.data.choices[0].message.content;
+    return res.data.choices[0].message.content;
   } catch (err) {
-    console.error("Memory Compression Failed:", err.message);
-    return currentMemory; // Fallback to old memory if it fails
+    console.error("Memory Update Failed:", err.message);
+    return currentMemory;
   }
 }
 
-// --- MAIN PROXY ROUTE ---
+// --- MAIN ROUTE ---
 app.post("/v1/chat/completions", async (req, res) => {
   const body = req.body;
   const convoId = getConversationId(body);
   const session = loadSession(convoId);
 
-  // 1. Intercept Slash Commands (Before setting stream headers)
+  // 1. Commands
   const lastMsg = body.messages?.slice(-1)[0]?.content?.trim().toLowerCase();
-  
   if (lastMsg === "/reset") {
-    const f = sessionFile(convoId);
-    if (fs.existsSync(f)) fs.unlinkSync(f);
-    return res.json({ choices: [{ message: { role: "assistant", content: "(OOC: Memory and history reset.)" } }] });
+    if (fs.existsSync(sessionFile(convoId))) fs.unlinkSync(sessionFile(convoId));
+    return res.json({ choices: [{ message: { role: "assistant", content: "(OOC: Memory reset.)" } }] });
   }
 
-  if (lastMsg === "/stats") {
-    const activeMsgs = body.messages.slice(session.hidden_message_count);
-    const stats = {
-      session_id: convoId,
-      total_messages_from_client: body.messages.length,
-      hidden_compressed_messages: session.hidden_message_count,
-      active_uncompressed_messages: activeMsgs.length,
-      estimated_active_tokens: estimateTokens(activeMsgs),
-      memory_present: !!session.structured_memory
-    };
-    return res.json({ choices: [{ message: { role: "assistant", content: `(OOC: Stats)\n${JSON.stringify(stats, null, 2)}` } }] });
-  }
-
-  if (lastMsg === "/memory") {
-    return res.json({ choices: [{ message: { role: "assistant", content: `(OOC: Current Memory Ledger)\n${session.structured_memory || "No memory stored."}` } }] });
-  }
-
-  // 2. Stream Setup & Cleanup
+  // 2. Stream Setup
   if (activeStreams.has(convoId)) {
-    const oldRes = activeStreams.get(convoId);
-    if (!oldRes.writableEnded) oldRes.end();
-    activeStreams.delete(convoId);
+    try { activeStreams.get(convoId).end(); } catch {}
   }
   activeStreams.set(convoId, res);
 
   res.setHeader("Content-Type", "text/event-stream");
-  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
   res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
   res.flushHeaders();
 
-  // Janitor AI specific heartbeat (Sent to client, not localhost)
-  const heartbeat = setInterval(() => {
-    if (!res.writableEnded) res.write(": heartbeat\n\n");
-  }, 15000);
+  const heartbeat = setInterval(() => { if (!res.writableEnded) res.write(": heartbeat\n\n"); }, 15000);
 
   const cleanup = () => {
     clearInterval(heartbeat);
@@ -165,103 +111,67 @@ app.post("/v1/chat/completions", async (req, res) => {
     activeStreams.delete(convoId);
   };
 
-  res.on("close", cleanup); // If Janitor AI user closes tab or cancels
+  res.on("close", cleanup);
 
   try {
-    // 3. Memory Compression Logic
+    // 3. Compression Trigger
     let activeMessages = body.messages.slice(session.hidden_message_count);
-    let currentTokens = estimateTokens(activeMessages);
-
-    if (currentTokens > 100000 && !session.compression_pending) {
-      console.log(`[${convoId}] 100k limit reached. Compressing memory...`);
+    if (estimateTokens(activeMessages) > 100000 && !session.compression_pending) {
       session.compression_pending = true;
-      
-      // Compress everything except the last 15 messages to maintain immediate context
-      const messagesToCompress = activeMessages.slice(0, -15);
-      
-      const newMemory = await updateStructuredMemory(messagesToCompress, session.structured_memory, body.model);
-      
-      session.structured_memory = newMemory;
-      session.hidden_message_count += messagesToCompress.length; // Hide these from future LLM calls
+      const toCompress = activeMessages.slice(0, -15);
+      session.structured_memory = await updateStructuredMemory(toCompress, session.structured_memory, body.model);
+      session.hidden_message_count += toCompress.length;
       session.compression_pending = false;
-      
       saveSession(convoId, session);
-      
-      // Update activeMessages for the current request
       activeMessages = body.messages.slice(session.hidden_message_count);
-      console.log(`[${convoId}] Memory updated successfully.`);
     }
 
-    // 4. Construct Final Prompt
+    // 4. Prompt Assembly
     const finalMessages = [];
-
     if (MASTER_PROMPT) {
       finalMessages.push({ role: "system", content: MASTER_PROMPT });
-      finalMessages.push({ role: "system", content: "Characters should naturally take initiative and advance scenes through actions or dialogue.\nDialogue should dominate over narration.\nEach response should move the scene forward through action, emotional shift, or tension." });
+      finalMessages.push({ role: "system", content: "Dialogue dominates narration. Advance scenes through action/tension." });
     }
-
     if (session.structured_memory) {
-      finalMessages.push({
-        role: "system",
-        content: `[IMPORTANT CONTEXT: The following is a ledger of secrets, relationship changes, and world events that have occurred. You must prioritize these details over the generic history.]\n\n${session.structured_memory}`
-      });
+      finalMessages.push({ role: "system", content: `[MEMORY LEDGER: Prioritize these secrets/changes]\n${session.structured_memory}` });
     }
-
     finalMessages.push(...activeMessages);
 
-    const finalBody = {
-      ...body,
-      messages: finalMessages,
-      stream: true,
-      max_tokens: 4096
-    };
+    // 5. Upstream Streaming with Fragment Stitching
+    const upstream = await callModel({ ...body, messages: finalMessages, stream: true, max_tokens: 4096 });
+    let lineBuffer = "";
 
-    // 5. Call Upstream & Stream Response
-    const upstream = await callModel(finalBody);
-    let streamBuffer = "";
+    upstream.data.on("data", (chunk) => {
+      lineBuffer += chunk.toString();
+      let lines = lineBuffer.split("\n");
+      lineBuffer = lines.pop(); // Hold onto the potentially split last line
 
-    upstream.data.on("data", chunk => {
-      const text = chunk.toString();
-      
-      if (!res.writableEnded) {
-        res.write(chunk);
-      }
-
-      // Robust [DONE] detection using a trailing buffer
-      streamBuffer += text;
-      if (streamBuffer.length > 100) streamBuffer = streamBuffer.slice(-100);
-      
-      if (streamBuffer.includes("[DONE]")) {
-        cleanup();
-        // Destroy the axios stream to prevent memory leaks
-        if (upstream.data && typeof upstream.data.destroy === 'function') {
-           upstream.data.destroy();
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        if (!res.writableEnded) res.write(line + "\n");
+        
+        if (line.includes("data: [DONE]")) {
+          cleanup();
+          if (upstream.data?.destroy) upstream.data.destroy();
         }
       }
     });
 
-    upstream.data.on("error", err => {
-      console.error(`[${convoId}] Upstream stream error:`, err.message);
+    upstream.data.on("end", () => {
+      if (lineBuffer.trim() && !res.writableEnded) res.write(lineBuffer + "\n\n");
       cleanup();
     });
 
   } catch (err) {
-    console.error(`[${convoId}] Proxy failure:`, err.message);
+    console.error("Proxy Error:", err.message);
     if (!res.writableEnded) {
-      res.write(`data: {"choices": [{"delta": {"content": "\\n\\n[System: Proxy encountered an error. Please retry.]"}}]}\n\n`);
+      res.write(`data: {"choices":[{"delta":{"content":"\\n[Proxy Error: Connection interrupted. Please retry.]"}}]}\n\n`);
       res.write("data: [DONE]\n\n");
     }
     cleanup();
   }
 });
 
-// Warm ping for Render
 app.get("/ping", (req, res) => res.send("alive"));
-
-setInterval(async () => {
-  try { await axios.get(`http://localhost:${PORT}/ping`); } catch {}
-}, 240000);
-
-app.listen(PORT, () => {
-  console.log(`LLM Proxy v3.0 running on port ${PORT}`);
-});
+setInterval(async () => { try { await axios.get(`http://localhost:${PORT}/ping`); } catch {} }, 240000);
+app.listen(PORT, () => console.log(`Proxy v3.1 Active`));
