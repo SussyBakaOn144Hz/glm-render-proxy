@@ -199,7 +199,7 @@ Each response should move the scene forward through action, tension, or emotiona
       ...body,
       messages: finalMessages,
       stream: true,
-      max_tokens: 1500
+      max_tokens: 4096
     };
 
     const upstream = await callModel(finalBody);
@@ -230,7 +230,8 @@ Each response should move the scene forward through action, tension, or emotiona
     upstream.data.on("end", () => {
 
       if (!finished) {
-        res.write("data: [DONE]\n\n");
+        console.log("Upstream ended early, keeping connection alive");
+    return;
       }
 
       clearInterval(heartbeat);
